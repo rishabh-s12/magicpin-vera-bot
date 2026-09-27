@@ -207,13 +207,36 @@ def _h_perf_dip(category, merchant, trigger, customer):
     return body, "binary_yes_no"
 
 
+def _customer_noun(category: dict) -> str:
+    """The right word for 'people we serve', per category — avoids calling
+    a restaurant's diners 'patients' or a salon's clients 'patients'."""
+    slug = (g(category, "slug") or "").lower()
+    mapping = {
+        "restaurant": "diners",
+        "dental": "patients",
+        "healthcare": "patients",
+        "clinic": "patients",
+        "pharmacy": "customers",
+        "salon": "clients",
+        "beauty": "clients",
+        "fitness": "members",
+        "gym": "members",
+        "yoga": "members",
+    }
+    for key, noun in mapping.items():
+        if key in slug:
+            return noun
+    return "customers"
+
+
 def _h_milestone_reached(category, merchant, trigger, customer):
     name = salutation(merchant, category)
     milestone = g(trigger, "payload", "milestone") or g(trigger, "payload", "note")
     agg = g(merchant, "customer_aggregate") or {}
     if not milestone:
         reviews = agg.get("total_unique_ytd")
-        milestone = f"{reviews} patients this year" if reviews else "a milestone"
+        noun = _customer_noun(category)
+        milestone = f"{reviews} {noun} this year" if reviews else "a milestone"
     body = f"{name}, you just crossed {milestone} 🎉 Want me to draft a quick post to share it?"
     return body, "binary_yes_no"
 
@@ -440,24 +463,6 @@ def _h_chronic_refill_due(category, merchant, trigger, customer):
     return body, "binary_yes_no"
 
 
-def _h_appointment_tomorrow(category, merchant, trigger, customer):
-    """Customer-facing reminder. Trigger payload for this kind is often a
-    placeholder in the generated dataset, so we ground the message in real
-    customer/merchant fields instead of inventing an appointment time."""
-    cust_name = g(customer, "identity", "name") or "there"
-    m_name = merchant_name(merchant)
-    payload = g(trigger, "payload") or {}
-    when = payload.get("appointment_time") or payload.get("slot") or "tomorrow"
-    services = g(customer, "relationship", "services_received") or []
-    last_service = services[-1].replace("_", " ") if services else None
-    service_note = f" for your {last_service}" if last_service else ""
-    body = (
-        f"Hi {cust_name}, {m_name} here — reminder that you're booked in {when}"
-        f"{service_note}. Reply to confirm, or let us know if you need to reschedule."
-    )
-    return body, "binary_yes_no"
-
-
 def _h_category_seasonal(category, merchant, trigger, customer):
     name = salutation(merchant, category)
     payload = g(trigger, "payload") or {}
@@ -481,9 +486,7 @@ def _h_generic(category, merchant, trigger, customer):
     # we never emit pure filler, even for unhandled trigger kinds.
     fact = None
     for k, v in payload.items():
-        if isinstance(v, bool) or k in ("category", "placeholder"):
-            continue
-        if isinstance(v, (str, int, float)):
+        if isinstance(v, (str, int, float)) and k not in ("category",):
             fact = f"{k.replace('_',' ')}: {v}"
             break
     if customer:
@@ -525,7 +528,6 @@ HANDLERS = {
     "supply_alert": _h_supply_alert,
     "chronic_refill_due": _h_chronic_refill_due,
     "category_seasonal": _h_category_seasonal,
-    "appointment_tomorrow": _h_appointment_tomorrow,
 }
 
 
