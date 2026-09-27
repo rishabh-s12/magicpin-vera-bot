@@ -476,6 +476,22 @@ def _h_category_seasonal(category, merchant, trigger, customer):
     )
     return body, "binary_yes_no"
 
+def _h_appointment_tomorrow(category, merchant, trigger, customer):
+    """Customer-facing reminder. This kind's trigger payload is placeholder-only
+    in the dataset, so ground the message in real customer/merchant fields
+    instead of inventing an appointment time."""
+    cust_name = g(customer, "identity", "name") or "there"
+    m_name = merchant_name(merchant)
+    payload = g(trigger, "payload") or {}
+    when = payload.get("appointment_time") or payload.get("slot") or "tomorrow"
+    services = g(customer, "relationship", "services_received") or []
+    last_service = services[-1].replace("_", " ") if services else None
+    service_note = f" for your {last_service}" if last_service else ""
+    body = (
+        f"Hi {cust_name}, {m_name} here — reminder that you're booked in {when}"
+        f"{service_note}. Reply to confirm, or let us know if you need to reschedule."
+    )
+    return body, "binary_yes_no"
 
 # Fallback for every trigger kind not given a named handler above.
 def _h_generic(category, merchant, trigger, customer):
@@ -486,9 +502,12 @@ def _h_generic(category, merchant, trigger, customer):
     # we never emit pure filler, even for unhandled trigger kinds.
     fact = None
     for k, v in payload.items():
-        if isinstance(v, (str, int, float)) and k not in ("category",):
+        if isinstance(v, bool) or k in ("category", "placeholder"):
+            continue
+        if isinstance(v, (str, int, float)):
             fact = f"{k.replace('_',' ')}: {v}"
             break
+    
     if customer:
         cust_name = g(customer, "identity", "name") or "there"
         body = (
@@ -528,6 +547,7 @@ HANDLERS = {
     "supply_alert": _h_supply_alert,
     "chronic_refill_due": _h_chronic_refill_due,
     "category_seasonal": _h_category_seasonal,
+    "appointment_tomorrow": _h_appointment_tomorrow,
 }
 
 
