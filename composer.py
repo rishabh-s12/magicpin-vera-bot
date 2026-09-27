@@ -146,11 +146,15 @@ def _h_perf_spike(category, merchant, trigger, customer):
     perf = g(merchant, "performance") or {}
     views_pct = g(perf, "delta_7d", "views_pct")
     views = perf.get("views")
+    peer_views = g(category, "peer_stats", "avg_views_30d")
     if views_pct:
+        cmp_str = ""
+        if views is not None and peer_views:
+            cmp_str = f" That puts you at {views:,} vs a peer average of {peer_views:,}."
         body = (
             f"{name}, your listing views are up {fmt_pct(views_pct)} this week"
             + (f" ({views:,} total)" if views else "")
-            + ". Good moment to push a post or highlight your top offer while attention is high — want me to draft one?"
+            + f".{cmp_str} Good moment to push a post or highlight your top offer while attention is high — want me to draft one?"
         )
     else:
         payload_note = g(trigger, "payload", "note") or "your profile is seeing more activity than usual"
