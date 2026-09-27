@@ -1,35 +1,10 @@
 """
 composer.py — the deterministic decision + copy engine for Vera.
-
-Design philosophy (see README.md for the full tradeoff discussion):
-  - Deterministic, rule-based, no LLM call. This trades some phrasing
-    variety for: zero timeout risk, zero API cost, 100% reproducibility
-    (the brief explicitly requires determinism), and zero hallucination
-    risk — every fact in every message is read directly off the context
-    dicts the judge pushes us. Nothing is ever invented.
-  - One handler per well-documented trigger `kind` (research_digest,
-    regulation_change, recall_due, perf_spike, perf_dip, milestone_reached,
-    review_theme_emerged, renewal_due, gbp_unverified, dormant_with_vera,
-    festival_upcoming, competitor_opened, cde_opportunity, curious_ask_due,
-    winback/lapsed customer flows), each grounded in real fields from the
-    trigger payload, merchant context, and category context (digest items,
-    peer_stats, offer_catalog).
-  - A generic fallback handler for every other trigger kind in the dataset
-    (chronic_refill_due, supply_alert, wedding_package_followup,
-    trial_followup, ipl_match_today, category_seasonal,
-    active_planning_intent, ...) that still grounds itself in whatever
-    concrete fields exist in trigger.payload / merchant.signals rather than
-    emitting filler — but is inherently less tailored than the named
-    handlers. Extending coverage there is the highest-leverage next step
-    (see README).
+(v2 — synced from user's latest GitHub version, patched here for testing)
 """
 
 from typing import Optional, Dict, Any, List
 
-
-# ---------------------------------------------------------------------------
-# Generic helpers — defensive nested getters, never raise on missing keys
-# ---------------------------------------------------------------------------
 
 def g(d: Optional[dict], *path, default=None):
     cur = d
@@ -49,7 +24,6 @@ def owner_first(merchant: dict) -> Optional[str]:
 
 
 def salutation(merchant: dict, category: dict) -> str:
-    """Category voice may prefer 'Dr. {first}' etc; fall back to owner first name or business name."""
     owner = owner_first(merchant)
     examples = g(category, "voice", "salutation_examples") or []
     if owner and examples and any("{first_name}" in e for e in examples):
@@ -102,11 +76,14 @@ def suppression_key_for(trigger: dict) -> str:
     return trigger.get("suppression_key") or f"{trigger.get('kind','unknown')}:{trigger.get('merchant_id','')}"
 
 
-# ---------------------------------------------------------------------------
-# Per-kind handlers.
-# Each returns (body, cta) — send_as/rationale/suppression_key are added by
-# the caller (compose()) since they follow a uniform rule across handlers.
-# ---------------------------------------------------------------------------
+def category_slug(category: dict, merchant: dict) -> str:
+    return (g(category, "slug") or merchant.get("category_slug") or "").lower()
+
+
+def is_category(category: dict, merchant: dict, *keys) -> bool:
+    slug = category_slug(category, merchant)
+    return any(k in slug for k in keys)
+
 
 def _h_research_digest(category, merchant, trigger, customer):
     item = digest_item(category, g(trigger, "payload", "top_item_id"))
@@ -208,8 +185,6 @@ def _h_perf_dip(category, merchant, trigger, customer):
 
 
 def _customer_noun(category: dict) -> str:
-    """The right word for 'people we serve', per category — avoids calling
-    a restaurant's diners 'patients' or a salon's clients 'patients'."""
     slug = (g(category, "slug") or "").lower()
     mapping = {
         "restaurant": "diners",
@@ -231,13 +206,43 @@ def _customer_noun(category: dict) -> str:
 
 def _h_milestone_reached(category, merchant, trigger, customer):
     name = salutation(merchant, category)
-    milestone = g(trigger, "payload", "milestone") or g(trigger, "payload", "note")
+    payload = g(trigger, "payload") or {}
+    metric = payload.get("metric")
+    value_now = payload.get("value_now")
+    milestone_value = payload.get("milestone_value")
+    is_imminent = payload.get("is_imminent")
+
+    # Real structured milestone data (not every milestone_reached trigger
+    # in the dataset is a placeholder — some carry an actual metric/value).
+    # Use it when present instead of falling back to a generic count, and
+    # get the tense right: "is_imminent" + value_now < milestone_value
+    # means they haven't crossed it yet.
+    if metric and milestone_value is not None:
+        metric_label = {"review_count": "reviews"}.get(metric, metric.replace("_", " "))
+        if is_imminent and value_now is not None and value_now < milestone_value:
+            remaining = milestone_value - value_now
+            body = (
+                f"{name}, you're just {remaining} {metric_label} away from {milestone_value} {metric_label} — "
+                f"want me to line up a post to go out the moment you hit it?"
+            )
+        else:
+            body = (
+                f"{name}, you just crossed {milestone_value} {metric_label} 🎉 "
+                f"Want me to draft a quick post to share it while it's fresh?"
+            )
+        return body, "binary_yes_no"
+
+    # Fallback for placeholder-only milestone triggers: use the customer
+    # aggregate count. No peer comparison here — none of the category's
+    # peer_stats fields actually measure "unique customers this year", so
+    # claiming above/below peer average would be an unverifiable guess.
+    milestone = payload.get("milestone") or payload.get("note")
     agg = g(merchant, "customer_aggregate") or {}
+    noun = _customer_noun(category)
     if not milestone:
         reviews = agg.get("total_unique_ytd")
-        noun = _customer_noun(category)
         milestone = f"{reviews} {noun} this year" if reviews else "a milestone"
-    body = f"{name}, you just crossed {milestone} 🎉 Want me to draft a quick post to share it?"
+    body = f"{name}, you just crossed {milestone} 🎉 Want me to draft a quick post to share it while it's fresh?"
     return body, "binary_yes_no"
 
 
@@ -277,8 +282,9 @@ def _h_competitor_opened(category, merchant, trigger, customer):
             f"Want me to check how your listing compares side-by-side?"
         )
     else:
+        slug = g(category, "slug", default="competitor")
         body = (
-            f"{name}, a new {g(category,'slug',default='competitor')} listing opened{dist_str} on Google. "
+            f"{name}, a new {slug} listing opened{dist_str} in {locality(merchant)} on Google. "
             f"Want me to check how your listing compares side-by-side?"
         )
     return body, "open_ended"
@@ -290,11 +296,15 @@ def _h_dormant_with_vera(category, merchant, trigger, customer):
     for s in signals(merchant):
         if s.startswith("stale_posts:"):
             days = s.split(":")[1]
-    reviews = g(category, "peer_stats", "avg_review_count")
+    offers = active_offers(merchant)
+    loc = locality(merchant)
+    hook = (
+        f"your last post was {days} ago" if days else
+        (f"\"{offers[0]['title']}\" is still your only live offer" if offers else f"it's been quiet on your {loc} listing")
+    )
     body = (
-        f"{name}, it's been a while since we last talked"
-        + (f" — your last post was {days} ago" if days else "")
-        + ". Quick one: what's the treatment/service you're getting asked about most this week?"
+        f"{name}, {hook}. Quick one: what's the treatment/service you're getting asked about most this week? "
+        f"I'll turn it into a post."
     )
     return body, "open_ended"
 
@@ -321,10 +331,24 @@ def _h_gbp_unverified(category, merchant, trigger, customer):
 
 def _h_festival_upcoming(category, merchant, trigger, customer):
     name = salutation(merchant, category)
-    festival = g(trigger, "payload", "festival") or g(trigger, "payload", "name") or "the festival"
-    days = g(trigger, "payload", "days_until")
-    when = f"in {days} days" if days else "coming up"
+    payload = g(trigger, "payload") or {}
+    festival = payload.get("festival") or payload.get("name")
+    days = payload.get("days_until")
     offers = active_offers(merchant)
+    if not festival:
+        # Placeholder trigger with no real festival name/date — ground in
+        # what we do know (locality, existing offer) instead of a bare
+        # "the festival is coming up" line.
+        loc = locality(merchant)
+        if offers:
+            body = (
+                f"{name}, festival season is coming up for {loc} — want me to build a limited-time "
+                f"version of your \"{offers[0]['title']}\" offer around it?"
+            )
+        else:
+            body = f"{name}, festival season is coming up for {loc} — want me to draft a festival offer from your catalog?"
+        return body, "binary_yes_no"
+    when = f"in {days} days" if days else "coming up"
     offer_note = f" I can tie it to your \"{offers[0]['title']}\" offer." if offers else " Want me to draft a festival offer from your catalog?"
     body = f"{name}, {festival} is {when}.{offer_note}"
     return body, "binary_yes_no"
@@ -334,13 +358,16 @@ def _h_curious_ask(category, merchant, trigger, customer):
     name = salutation(merchant, category)
     question = g(trigger, "payload", "question")
     if not question:
-        question = "What's the one service/treatment you wish more customers knew you offered?"
+        slug = g(category, "slug", default="")
+        loc = locality(merchant)
+        # Ground the fallback in the merchant's actual category/locality
+        # instead of a pure generic line, so it reads as merchant-specific.
+        question = f"what's the one {slug or 'service'} question {loc} customers ask you most?"
     body = f"{name}, quick one: {question}"
     return body, "open_ended"
 
 
 def _h_recall_due(category, merchant, trigger, customer):
-    """Customer-facing (scope=customer). send_as=merchant_on_behalf."""
     cust_name = g(customer, "identity", "name") or "there"
     m_name = merchant_name(merchant)
     last_visit = g(trigger, "payload", "last_service_date") or g(customer, "relationship", "last_visit")
@@ -357,7 +384,6 @@ def _h_recall_due(category, merchant, trigger, customer):
 
 
 def _h_winback(category, merchant, trigger, customer):
-    """customer_lapsed_soft / customer_lapsed_hard / winback_eligible — customer-facing."""
     cust_name = g(customer, "identity", "name") or "there"
     m_name = merchant_name(merchant)
     last_visit = g(customer, "relationship", "last_visit")
@@ -402,7 +428,7 @@ def _h_ipl_match_today(category, merchant, trigger, customer):
     return body, "binary_yes_no"
 
 
-def _h_active_planning_intent(category, merchant, trigger, customer):  # noqa: F811 (intentional override below is more specific)
+def _h_active_planning_intent(category, merchant, trigger, customer):
     name = salutation(merchant, category)
     payload = g(trigger, "payload") or {}
     topic = (payload.get("intent_topic") or "").replace("_", " ")
@@ -448,17 +474,46 @@ def _h_supply_alert(category, merchant, trigger, customer):
 
 
 def _h_chronic_refill_due(category, merchant, trigger, customer):
-    """Customer-facing pharmacy refill logistics reminder — operational, not medical advice."""
+    """Customer-facing recurring-consumption reminder. This kind gets
+    assigned to merchants across ALL categories in the dataset (not just
+    pharmacies), so branch on category instead of assuming medicine."""
     cust_name = g(customer, "identity", "name") or "there"
     m_name = merchant_name(merchant)
     payload = g(trigger, "payload") or {}
-    runs_out = payload.get("stock_runs_out_iso", "")
-    runs_out_date = runs_out.split("T")[0] if runs_out else "soon"
-    delivery = payload.get("delivery_address_saved")
-    delivery_note = " We can deliver to your saved address." if delivery else ""
+
+    if is_category(category, merchant, "pharma", "chemist"):
+        runs_out = payload.get("stock_runs_out_iso", "")
+        runs_out_date = runs_out.split("T")[0] if runs_out else "soon"
+        delivery = payload.get("delivery_address_saved")
+        delivery_note = " We can deliver to your saved address." if delivery else ""
+        body = (
+            f"Hi {cust_name}, {m_name} here — your regular refill is running low, expected to last until "
+            f"{runs_out_date}. Want us to prepare your usual refill for pickup or delivery?{delivery_note}"
+        )
+    else:
+        # Generic recurring-visit framing for non-pharmacy merchants this
+        # kind lands on (dental, salon, fitness, etc.) instead of medical
+        # "refill" language that doesn't fit those categories.
+        last_visit = g(customer, "relationship", "last_visit")
+        visit_note = f" since your last visit ({last_visit})" if last_visit else " for a while"
+        body = (
+            f"Hi {cust_name}, {m_name} here — it's about time for your next regular top-up{visit_note}. "
+            f"Want me to book your usual slot?"
+        )
+    return body, "binary_yes_no"
+
+
+def _h_appointment_tomorrow(category, merchant, trigger, customer):
+    cust_name = g(customer, "identity", "name") or "there"
+    m_name = merchant_name(merchant)
+    payload = g(trigger, "payload") or {}
+    when = payload.get("appointment_time") or payload.get("slot") or "tomorrow"
+    services = g(customer, "relationship", "services_received") or []
+    last_service = services[-1].replace("_", " ") if services else None
+    service_note = f" for your {last_service}" if last_service else ""
     body = (
-        f"Hi {cust_name}, {m_name} here — your regular refill is running low, expected to last until "
-        f"{runs_out_date}. Want us to prepare your usual refill for pickup or delivery?{delivery_note}"
+        f"Hi {cust_name}, {m_name} here — reminder that you're booked in {when}"
+        f"{service_note}. Reply to confirm, or let us know if you need to reschedule."
     )
     return body, "binary_yes_no"
 
@@ -476,30 +531,11 @@ def _h_category_seasonal(category, merchant, trigger, customer):
     )
     return body, "binary_yes_no"
 
-def _h_appointment_tomorrow(category, merchant, trigger, customer):
-    """Customer-facing reminder. This kind's trigger payload is placeholder-only
-    in the dataset, so ground the message in real customer/merchant fields
-    instead of inventing an appointment time."""
-    cust_name = g(customer, "identity", "name") or "there"
-    m_name = merchant_name(merchant)
-    payload = g(trigger, "payload") or {}
-    when = payload.get("appointment_time") or payload.get("slot") or "tomorrow"
-    services = g(customer, "relationship", "services_received") or []
-    last_service = services[-1].replace("_", " ") if services else None
-    service_note = f" for your {last_service}" if last_service else ""
-    body = (
-        f"Hi {cust_name}, {m_name} here — reminder that you're booked in {when}"
-        f"{service_note}. Reply to confirm, or let us know if you need to reschedule."
-    )
-    return body, "binary_yes_no"
 
-# Fallback for every trigger kind not given a named handler above.
 def _h_generic(category, merchant, trigger, customer):
     name = salutation(merchant, category)
     kind = trigger.get("kind", "an update").replace("_", " ")
     payload = g(trigger, "payload") or {}
-    # Pull the first concrete, human-readable fact out of the payload so
-    # we never emit pure filler, even for unhandled trigger kinds.
     fact = None
     for k, v in payload.items():
         if isinstance(v, bool) or k in ("category", "placeholder"):
@@ -507,7 +543,6 @@ def _h_generic(category, merchant, trigger, customer):
         if isinstance(v, (str, int, float)):
             fact = f"{k.replace('_',' ')}: {v}"
             break
-    
     if customer:
         cust_name = g(customer, "identity", "name") or "there"
         body = (
@@ -552,18 +587,11 @@ HANDLERS = {
 
 
 def strip_urls_penalty_guard(body: str) -> str:
-    """The judge hard-fails any body containing a URL (Meta would reject
-    the actual WhatsApp send). Defensive strip in case a handler ever
-    interpolates one in from context."""
     import re
     return re.sub(r"https?://\S+", "", body).strip()
 
 
 def compose(category: dict, merchant: dict, trigger: dict, customer: Optional[dict] = None) -> Dict[str, Any]:
-    """
-    Public entrypoint matching the challenge's compose() contract.
-    Returns: body, cta, send_as, suppression_key, rationale.
-    """
     category = category or {}
     merchant = merchant or {}
     trigger = trigger or {}
