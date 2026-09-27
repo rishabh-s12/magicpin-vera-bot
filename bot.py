@@ -52,7 +52,7 @@ TEAM_METADATA = {
                 "directly in category digest/peer_stats + merchant performance/"
                 "offers/signals + (when present) customer relationship/preferences. "
                 "No generation step invents data outside the pushed contexts.",
-    "contact_email": "",
+    "contact_email": "rishabhsagar_23it132@dtu.ac.in",
     "version": "1.0.0",
     "submitted_at": datetime.utcnow().isoformat() + "Z",
 }
